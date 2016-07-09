@@ -1,11 +1,13 @@
 package httpz
 
 import com.ning.http.client.{Request => NingRequest, Response => NingResponse, _}
-import scalaz.concurrent.Task
+import scalaz.concurrent.{Future, Task}
 import scala.collection.convert.decorateAsJava._
 import java.util.Collections.singletonList
 import java.util.{Collection => JCollection}
 import scalaz._
+import scala.concurrent.duration._
+import scala.concurrent.{Await, Promise}
 
 package object async {
 
@@ -39,35 +41,40 @@ package object async {
     builder.build
   }
 
-
-  private def execute(request: NingRequest): Task[Response[ByteArray]] = {
+  private def execute(request: NingRequest): Promise[Throwable \/ Response[ByteArray]] = {
     val config = new AsyncHttpClientConfig.Builder()
+      .setMaxConnections(1)
       .setIOThreadMultiplier(1)
-      .build()
-    val client = new AsyncHttpClient(config)
-    Task.async[Response[ByteArray]]{ function =>
-      val handler = new AsyncCompletionHandler[Unit] {
-        def onCompleted(res: NingResponse) =
-          try{
-            import scala.collection.JavaConverters._
-            val body = new ByteArray(res.getResponseBodyAsBytes)
-            val status = res.getStatusCode
-            val headers = mapAsScalaMapConverter(res.getHeaders).asScala.mapValues(_.asScala.toList).toMap
-            client.closeAsynchronously()
-            function(\/-(Response(body, status, headers)))
-          }catch {
-            case e: Throwable =>
-              client.closeAsynchronously()
-              function(-\/(e))
+    val client = new AsyncHttpClient(config.build)
+    val promise = Promise[Throwable \/ Response[ByteArray]]
+    val handler = new AsyncCompletionHandler[Unit] {
+      def onCompleted(res: NingResponse) =
+        try{
+          import scala.collection.JavaConverters._
+          val body = new ByteArray(res.getResponseBodyAsBytes)
+          val status = res.getStatusCode
+          val headers = mapAsScalaMapConverter(res.getHeaders).asScala.mapValues(_.asScala.toList)
+          val r = \/-(Response(body, status, headers.toMap))
+          client.closeAsynchronously()
+          promise.success{
+            r
           }
-      }
-      client.executeRequest(request, handler)
+        }catch {
+          case e: Throwable =>
+            client.closeAsynchronously()
+            promise.success(-\/(e))
+        }
     }
+    client.executeRequest(request, handler)
+    promise
   }
 
   private[async] def request2async(r: Request): Task[Response[ByteArray]] = {
     val req = httpz2ning(r)
-    execute(req)
+    val promise = execute(req)
+    Task(Await.result(promise.future, 5.seconds)).flatMap{
+      a => new Task(Future.now(a))
+    }
   }
 
 }
